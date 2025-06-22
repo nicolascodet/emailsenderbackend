@@ -117,7 +117,7 @@ class MessageGeneratorAgent:
             # if not research_used and research_data.get('recent_activity'):
             # if not research_used and research_data.get('specific_trigger'):
             
-            if not research_used and prospect.sector:
+            if not research_used and prospect.sector and prospect.sector.lower() != 'unknown':
                 business_focus = f"works in {prospect.sector.lower()}"
                 research_used = True
                 logger.info(f"✅ Using sector: {business_focus}")
@@ -318,8 +318,46 @@ class MessageGeneratorAgent:
             else:
                 message_body = f"Hey {first_name},\n\nNoticed {prospect.company} {business_focus}.\n\nWorking on AI tools for {relevant_workflow}. Want to see what we built?"
             
-            # Create subject line
-            industry = prospect.sector or 'business'
+            # Create subject line - never use "unknown"
+            if prospect.sector and prospect.sector.lower() != 'unknown':
+                industry = prospect.sector.lower()
+            else:
+                # Smart fallbacks based on company or title
+                if prospect.company:
+                    company_lower = prospect.company.lower()
+                    if any(word in company_lower for word in ['tech', 'software']):
+                        industry = 'tech'
+                    elif any(word in company_lower for word in ['consulting', 'advisory']):
+                        industry = 'consulting'
+                    elif any(word in company_lower for word in ['real estate', 'property', 'realty']):
+                        industry = 'real estate'
+                    elif any(word in company_lower for word in ['legal', 'law', 'attorney']):
+                        industry = 'legal'
+                    elif any(word in company_lower for word in ['marketing', 'agency']):
+                        industry = 'marketing'
+                    elif any(word in company_lower for word in ['logistics', 'shipping']):
+                        industry = 'logistics'
+                    elif any(word in company_lower for word in ['research', 'analysis']):
+                        industry = 'research'
+                    elif any(word in company_lower for word in ['management', 'operations']):
+                        industry = 'operations'
+                    else:
+                        industry = 'business'
+                elif prospect.title:
+                    title_lower = prospect.title.lower()
+                    if any(word in title_lower for word in ['ceo', 'founder', 'executive']):
+                        industry = 'executive'
+                    elif any(word in title_lower for word in ['marketing', 'growth']):
+                        industry = 'marketing'
+                    elif any(word in title_lower for word in ['operations', 'ops']):
+                        industry = 'operations'
+                    elif any(word in title_lower for word in ['tech', 'engineering']):
+                        industry = 'tech'
+                    else:
+                        industry = 'business'
+                else:
+                    industry = 'business'
+            
             subject_line = f"AI for {industry} workflows"
             
             # Return the structured data directly (no GPT-4 needed for this simple template)
