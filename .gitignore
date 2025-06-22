@@ -31,3 +31,4 @@ wheels/
 .DS_Store
 venv/
 .venv/
+google_sheets_credentials.json

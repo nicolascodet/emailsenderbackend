@@ -9,6 +9,11 @@ from dotenv import load_dotenv
 import logging
 import csv
 from io import StringIO
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, date
+import pickle
 
 # Set up logging
 logging.basicConfig(
@@ -61,6 +66,47 @@ class WebsiteAnalyzer:
     def __init__(self):
         # Initialize OpenAI client (API key will be read from environment)
         self.client = OpenAI()
+        
+        # Gmail SMTP settings
+        self.smtp_server = "smtp.gmail.com"
+        self.smtp_port = 587
+        self.sender_email = os.getenv('GMAIL_EMAIL')
+        self.sender_password = os.getenv('GMAIL_APP_PASSWORD')  # Use App Password, not regular password
+        self.sender_name = os.getenv('SENDER_NAME', 'Nick')
+        
+        # Daily email tracking
+        self.daily_limit = int(os.getenv('DAILY_EMAIL_LIMIT', '50'))  # Start conservative
+        self.tracking_file = 'email_tracking.pkl'
+        self.today_count = self.load_daily_count()
+    
+    def load_daily_count(self):
+        """Load today's email count from tracking file"""
+        try:
+            if os.path.exists(self.tracking_file):
+                with open(self.tracking_file, 'rb') as f:
+                    data = pickle.load(f)
+                    if data.get('date') == str(date.today()):
+                        return data.get('count', 0)
+            return 0
+        except Exception as e:
+            logger.warning(f"Could not load email tracking: {e}")
+            return 0
+    
+    def save_daily_count(self):
+        """Save today's email count to tracking file"""
+        try:
+            data = {
+                'date': str(date.today()),
+                'count': self.today_count
+            }
+            with open(self.tracking_file, 'wb') as f:
+                pickle.dump(data, f)
+        except Exception as e:
+            logger.warning(f"Could not save email tracking: {e}")
+    
+    def can_send_email(self):
+        """Check if we can send another email today"""
+        return self.today_count < self.daily_limit
         
     def scrape_website(self, url):
         """Scrapes main content from website"""
@@ -149,11 +195,20 @@ class WebsiteAnalyzer:
             return None
 
     def send_email(self, client, analysis):
-        """Opens default mail client with pre-filled email"""
+        """Send email via Gmail SMTP"""
         try:
+            # Check daily limit
+            if not self.can_send_email():
+                logger.warning(f"Daily email limit reached ({self.daily_limit}). Skipping {client['company']}")
+                return False
+            
+            # Validate Gmail credentials
+            if not self.sender_email or not self.sender_password:
+                logger.error("Gmail credentials not found. Please set GMAIL_EMAIL and GMAIL_APP_PASSWORD in .env")
+                return False
+            
             # Parse the analysis sections
             sections = {}
-            current_section = None
             for line in analysis.split('\n'):
                 line = line.strip()
                 if line.startswith('STRENGTH:'):
@@ -168,7 +223,16 @@ class WebsiteAnalyzer:
                     if 'areas' in sections:
                         sections['areas'].append(line.split('-', 1)[1].strip())
 
-            # More casual subject line
+            # Ensure we have all required sections
+            if not all(key in sections for key in ['strength', 'values', 'areas', 'case']):
+                logger.error(f"Missing required sections in analysis for {client['company']}")
+                return False
+            
+            if len(sections['areas']) < 3:
+                logger.error(f"Not enough areas found in analysis for {client['company']}")
+                return False
+
+            # Create email content
             subject = f"Quick idea for {client['company']}"
             
             body = f"""Hi {client['decision_maker'].split()[0]},
@@ -188,29 +252,44 @@ Would love to chat about this for 15 minutes if you're interested. No pressure a
 Here's my calendar if you want to grab a slot: https://calendly.com/nick-thunderbird-labs/15min
 
 Best,
-Nick
+{self.sender_name}
 
 P.S. Really liked how you focus on {sections['values'].lower()} - that's exactly the kind of impact we aim to support."""
+
+            # Create message
+            msg = MIMEMultipart()
+            msg['From'] = f"{self.sender_name} <{self.sender_email}>"
+            msg['To'] = client['email']
+            msg['Subject'] = subject
             
-            # URL encode the subject and body for mailto
-            import urllib.parse
-            subject_encoded = urllib.parse.quote(subject)
-            body_encoded = urllib.parse.quote(body)
+            # Add body to email
+            msg.attach(MIMEText(body, 'plain'))
             
-            # Create mailto URL and open it
-            mailto_url = f"mailto:{client['email']}?subject={subject_encoded}&body={body_encoded}"
-            subprocess.run(['open', mailto_url], check=True)
+            # Connect to Gmail SMTP server
+            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
+            server.starttls()  # Enable security
+            server.login(self.sender_email, self.sender_password)
             
-            # Sleep briefly to allow the email client to open
-            time.sleep(2)
+            # Send email
+            text = msg.as_string()
+            server.sendmail(self.sender_email, client['email'], text)
+            server.quit()
             
+            # Update daily count
+            self.today_count += 1
+            self.save_daily_count()
+            
+            logger.info(f"Email sent successfully to {client['email']} ({self.today_count}/{self.daily_limit} today)")
             return True
             
-        except subprocess.SubprocessError as e:
-            logger.error(f"Error sending email: {str(e)}")
+        except smtplib.SMTPAuthenticationError:
+            logger.error("Gmail authentication failed. Check your email and app password.")
+            return False
+        except smtplib.SMTPException as e:
+            logger.error(f"SMTP error sending email to {client['email']}: {str(e)}")
             return False
         except Exception as e:
-            logger.error(f"Unexpected error sending email: {str(e)}")
+            logger.error(f"Unexpected error sending email to {client['email']}: {str(e)}")
             return False
 
 def main():
@@ -248,9 +327,24 @@ def main():
         # Initialize analyzer
         analyzer = WebsiteAnalyzer()
         
+        # Check daily email status
+        remaining = analyzer.daily_limit - analyzer.today_count
+        print(f"📊 Daily email status: {analyzer.today_count}/{analyzer.daily_limit} sent today")
+        print(f"📈 Can send {remaining} more emails today")
+        
+        if remaining <= 0:
+            print("❌ Daily email limit reached. Please try again tomorrow.")
+            return
+        
+        # Limit processing to remaining daily allowance
+        clients_to_process = clients[:remaining]
+        if len(clients) > remaining:
+            print(f"⚠️  Processing only {remaining} companies due to daily limit")
+            print(f"   Remaining {len(clients) - remaining} will be skipped")
+        
         # Process each client
-        for i, client in enumerate(clients, 1):
-            print(f"\n[{i}/{len(clients)}] Processing {client['company']}...")
+        for i, client in enumerate(clients_to_process, 1):
+            print(f"\n[{i}/{len(clients_to_process)}] Processing {client['company']}...")
             
             # Scrape website
             content = analyzer.scrape_website(client['website'])
@@ -266,20 +360,23 @@ def main():
                 continue
             
             # Send email
-            print(f"📧 Creating email draft...")
+            print(f"📧 Sending email...")
             success = analyzer.send_email(client, analysis)
             
             if success:
-                print(f"✅ Email draft created for {client['company']}")
+                print(f"✅ Email sent to {client['company']} ({analyzer.today_count}/{analyzer.daily_limit} today)")
             else:
-                print(f"❌ Failed to create email draft for {client['company']}")
+                print(f"❌ Failed to send email to {client['company']}")
             
-            # Rate limiting
-            if i < len(clients):
-                print("\nWaiting 2 seconds before next company...")
-                time.sleep(2)
+            # Rate limiting - be gentle with Gmail
+            if i < len(clients_to_process):
+                print("\nWaiting 5 seconds before next email...")
+                time.sleep(5)  # Increased delay for better deliverability
 
-        print("\n✨ All done! Check your mail client for the drafts.")
+        print(f"\n✨ All done! Sent {analyzer.today_count} emails today.")
+        print(f"📊 Daily status: {analyzer.today_count}/{analyzer.daily_limit}")
+        if analyzer.today_count >= analyzer.daily_limit:
+            print("⚠️  Daily limit reached. Resume tomorrow for more sends.")
 
     except KeyboardInterrupt:
         print("\n\nProcess interrupted by user. Exiting...")
